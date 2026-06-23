@@ -2,11 +2,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use regex::Regex;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::LazyLock;
 use tempfile::TempDir;
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
@@ -14,6 +16,26 @@ use zip::write::SimpleFileOptions;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const APKTOOL_VERSION: &str = "2.9.3";
 const UBER_APK_SIGNER_VERSION: &str = "1.3.0";
+
+static JAVA_VERSION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""(?:1\.)?(\d+).*?""#).expect("valid Java version regex"));
+static APPLICATION_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?s)<application\b(?P<attrs>.*?)(?P<self>/?)>"#)
+        .expect("valid application tag regex")
+});
+static META_DATA_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?s)<meta-data\b(?P<attrs>.*?)(?P<self>/?)>"#).expect("valid meta-data tag regex")
+});
+static META_DATA_VALUE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\sandroid:value\s*=\s*(?:\"[^\"]*\"|'[^']*')"#)
+        .expect("valid meta-data value regex")
+});
+static SMALI_CLASS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\.class(?P<keywords>.+)? L(?P<name>[^\s]+);").expect("valid smali class regex")
+});
+static SMALI_IMPLEMENTS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\.implements L(?P<name>[^\s]+);").expect("valid smali implements regex")
+});
 
 #[derive(Parser, Debug)]
 #[command(
@@ -400,8 +422,7 @@ fn get_java_major_version() -> Result<u32> {
         "No \"java\" executable could be found. Make sure Java is installed and available in PATH.",
     )?;
     let text = String::from_utf8_lossy(&output.stderr);
-    let re = Regex::new(r#""(?:1\.)?(\d+).*?""#)?;
-    let major = re
+    let major = JAVA_VERSION_RE
         .captures(&text)
         .and_then(|caps| caps.get(1))
         .ok_or_else(|| {
@@ -612,8 +633,7 @@ fn modify_manifest(path: &Path, debuggable: bool, maps_api_key: Option<&str>) ->
 }
 
 fn set_application_attr(content: &str, name: &str, value: &str) -> Result<String> {
-    let app_re = Regex::new(r#"(?s)<application\b(?P<attrs>.*?)(?P<self>/?)>"#)?;
-    let caps = app_re
+    let caps = APPLICATION_TAG_RE
         .captures(content)
         .ok_or_else(|| anyhow!("AndroidManifest.xml has no <application> tag"))?;
     let whole = caps.get(0).unwrap().as_str();
@@ -638,11 +658,9 @@ fn set_application_attr(content: &str, name: &str, value: &str) -> Result<String
 }
 
 fn replace_maps_api_keys(content: &str, key: &str) -> Result<String> {
-    let meta_re = Regex::new(r#"(?s)<meta-data\b(?P<attrs>.*?)(?P<self>/?)>"#)?;
-    let value_re = Regex::new(r#"\sandroid:value\s*=\s*(?:\"[^\"]*\"|'[^']*')"#)?;
     let mut out = String::with_capacity(content.len());
     let mut last = 0;
-    for caps in meta_re.captures_iter(content) {
+    for caps in META_DATA_TAG_RE.captures_iter(content) {
         let whole = caps.get(0).unwrap();
         let tag = whole.as_str();
         if tag.contains("android:name=\"com.google.android.maps.v2.API_KEY\"")
@@ -652,8 +670,8 @@ fn replace_maps_api_keys(content: &str, key: &str) -> Result<String> {
         {
             out.push_str(&content[last..whole.start()]);
             let attrs = caps.name("attrs").unwrap().as_str();
-            let new_attrs = if value_re.is_match(attrs) {
-                value_re
+            let new_attrs = if META_DATA_VALUE_RE.is_match(attrs) {
+                META_DATA_VALUE_RE
                     .replace(attrs, format!(" android:value=\"{key}\""))
                     .to_string()
             } else {
@@ -708,9 +726,38 @@ struct SmaliPatch {
 
 struct SmaliMethodPatch {
     name: &'static str,
-    signature: &'static str,
+    pattern: &'static LazyLock<Regex>,
     replacement_lines: &'static [&'static str],
 }
+
+fn smali_method_regex(signature: &str) -> Regex {
+    Regex::new(&format!(
+        r"(?s)(\.method public (?:final )?{})\n(.+?)\n(\.end method)",
+        regex::escape(signature)
+    ))
+    .expect("valid smali method regex")
+}
+
+static X509_CHECK_CLIENT_TRUSTED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    smali_method_regex(
+        "checkClientTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
+    )
+});
+static X509_CHECK_SERVER_TRUSTED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    smali_method_regex(
+        "checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
+    )
+});
+static X509_GET_ACCEPTED_ISSUERS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    smali_method_regex("getAcceptedIssuers()[Ljava/security/cert/X509Certificate;")
+});
+static HOSTNAME_VERIFY_RE: LazyLock<Regex> =
+    LazyLock::new(|| smali_method_regex("verify(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z"));
+static CERT_PINNER_CHECK_LIST_RE: LazyLock<Regex> =
+    LazyLock::new(|| smali_method_regex("check(Ljava/lang/String;Ljava/util/List;)V"));
+static CERT_PINNER_CHECK_OKHTTP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    smali_method_regex("check$okhttp(Ljava/lang/String;Lkotlin/jvm/functions/Function0;)V")
+});
 
 const RETURN_VOID: &[&str] = &[".locals 0", "return-void"];
 const RETURN_TRUE: &[&str] = &[".locals 1", "const/4 v0, 0x1", "return v0"];
@@ -724,39 +771,39 @@ const RETURN_EMPTY_CERT_ARRAY: &[&str] = &[
 const X509_METHODS: &[SmaliMethodPatch] = &[
     SmaliMethodPatch {
         name: "X509TrustManager#checkClientTrusted (javax)",
-        signature: "checkClientTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
+        pattern: &X509_CHECK_CLIENT_TRUSTED_RE,
         replacement_lines: RETURN_VOID,
     },
     SmaliMethodPatch {
         name: "X509TrustManager#checkServerTrusted (javax)",
-        signature: "checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
+        pattern: &X509_CHECK_SERVER_TRUSTED_RE,
         replacement_lines: RETURN_VOID,
     },
     SmaliMethodPatch {
         name: "X509TrustManager#getAcceptedIssuers (javax)",
-        signature: "getAcceptedIssuers()[Ljava/security/cert/X509Certificate;",
+        pattern: &X509_GET_ACCEPTED_ISSUERS_RE,
         replacement_lines: RETURN_EMPTY_CERT_ARRAY,
     },
 ];
 const HOSTNAME_METHODS: &[SmaliMethodPatch] = &[SmaliMethodPatch {
     name: "HostnameVerifier#verify (javax)",
-    signature: "verify(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z",
+    pattern: &HOSTNAME_VERIFY_RE,
     replacement_lines: RETURN_TRUE,
 }];
 const OKHTTP2_METHODS: &[SmaliMethodPatch] = &[SmaliMethodPatch {
     name: "CertificatePinner#check (OkHttp 2.5)",
-    signature: "check(Ljava/lang/String;Ljava/util/List;)V",
+    pattern: &CERT_PINNER_CHECK_LIST_RE,
     replacement_lines: RETURN_VOID,
 }];
 const OKHTTP3_METHODS: &[SmaliMethodPatch] = &[
     SmaliMethodPatch {
         name: "CertificatePinner#check (OkHttp 3.x)",
-        signature: "check(Ljava/lang/String;Ljava/util/List;)V",
+        pattern: &CERT_PINNER_CHECK_LIST_RE,
         replacement_lines: RETURN_VOID,
     },
     SmaliMethodPatch {
         name: "CertificatePinner#check (OkHttp 4.2)",
-        signature: "check$okhttp(Ljava/lang/String;Lkotlin/jvm/functions/Function0;)V",
+        pattern: &CERT_PINNER_CHECK_OKHTTP_RE,
         replacement_lines: RETURN_VOID,
     },
 ];
@@ -822,20 +869,25 @@ fn disable_certificate_pinning(decode_dir: &Path) -> Result<bool> {
 fn process_smali_file(path: &Path) -> Result<bool> {
     let original = fs::read_to_string(path)?;
     let normalized = if cfg!(windows) {
-        original.replace("\r\n", "\n")
+        Cow::Owned(original.replace("\r\n", "\n"))
     } else {
-        original.clone()
+        Cow::Borrowed(original.as_str())
     };
     let head = parse_smali_head(&normalized)?;
     if head.is_interface {
         return Ok(false);
     }
-    let mut patched = normalized.clone();
-    let mut changed = false;
-    for patch in SMALI_PATCHES
+    let applicable_patches: Vec<_> = SMALI_PATCHES
         .iter()
         .filter(|patch| selector_matches(patch, &head))
-    {
+        .collect();
+    if applicable_patches.is_empty() {
+        return Ok(false);
+    }
+
+    let mut patched = normalized.into_owned();
+    let mut changed = false;
+    for patch in applicable_patches {
         for method in patch.methods {
             let (new_content, did_patch) = patch_smali_method(&patched, method)?;
             if did_patch {
@@ -855,14 +907,12 @@ fn process_smali_file(path: &Path) -> Result<bool> {
 }
 
 fn parse_smali_head(content: &str) -> Result<SmaliHead> {
-    let class_re = Regex::new(r"\.class(?P<keywords>.+)? L(?P<name>[^\s]+);")?;
-    let implements_re = Regex::new(r"\.implements L(?P<name>[^\s]+);")?;
-    let caps = class_re
+    let caps = SMALI_CLASS_RE
         .captures(content)
         .ok_or_else(|| anyhow!("Smali file has no .class line"))?;
     let keywords = caps.name("keywords").map(|m| m.as_str()).unwrap_or("");
     let name = caps.name("name").unwrap().as_str().to_string();
-    let implements = implements_re
+    let implements = SMALI_IMPLEMENTS_RE
         .captures_iter(content)
         .map(|caps| caps.name("name").unwrap().as_str().to_string())
         .collect();
@@ -885,32 +935,29 @@ fn selector_matches(patch: &SmaliPatch, head: &SmaliHead) -> bool {
 }
 
 fn patch_smali_method(content: &str, method: &SmaliMethodPatch) -> Result<(String, bool)> {
-    let escaped = regex::escape(method.signature);
-    let re = Regex::new(&format!(
-        r"(?s)(\.method public (?:final )?{})\n(.+?)\n(\.end method)",
-        escaped
-    ))?;
     let mut changed = false;
-    let result = re.replace_all(content, |caps: &regex::Captures| {
-        changed = true;
-        let body_lines = caps[2]
-            .split('\n')
-            .map(|line| line.strip_prefix("    ").unwrap_or(line));
-        let mut patched_body: Vec<String> =
-            vec!["# inserted by apk-mitm to disable certificate pinning".into()];
-        patched_body.extend(method.replacement_lines.iter().map(|line| line.to_string()));
-        patched_body.push(String::new());
-        patched_body.push("# commented out by apk-mitm to disable old method body".into());
-        patched_body.push("# ".into());
-        patched_body.extend(body_lines.map(|line| format!("# {line}")));
+    let result = method
+        .pattern
+        .replace_all(content, |caps: &regex::Captures| {
+            changed = true;
+            let body_lines = caps[2]
+                .split('\n')
+                .map(|line| line.strip_prefix("    ").unwrap_or(line));
+            let mut patched_body: Vec<String> =
+                vec!["# inserted by apk-mitm to disable certificate pinning".into()];
+            patched_body.extend(method.replacement_lines.iter().map(|line| line.to_string()));
+            patched_body.push(String::new());
+            patched_body.push("# commented out by apk-mitm to disable old method body".into());
+            patched_body.push("# ".into());
+            patched_body.extend(body_lines.map(|line| format!("# {line}")));
 
-        let body = patched_body
-            .into_iter()
-            .map(|line| format!("    {}", line).trim_end().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("{}\n{}\n{}", &caps[1], body, &caps[3])
-    });
+            let body = patched_body
+                .into_iter()
+                .map(|line| format!("    {}", line).trim_end().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{}\n{}\n{}", &caps[1], body, &caps[3])
+        });
     Ok((result.into_owned(), changed))
 }
 
