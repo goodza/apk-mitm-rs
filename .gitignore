@@ -2,4 +2,6 @@
 *.apk
 *.apks
 *.xapk
-apk-pure-wb-dl
+dl/
+.itest/
+*.txt

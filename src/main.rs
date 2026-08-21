@@ -1,21 +1,20 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use regex::Regex;
-use serde_json::Value;
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::LazyLock;
 use tempfile::TempDir;
 use walkdir::WalkDir;
-use zip::write::SimpleFileOptions;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const APKTOOL_VERSION: &str = "2.9.3";
 const UBER_APK_SIGNER_VERSION: &str = "1.3.0";
+const APKEDITOR_VERSION: &str = "1.4.3";
 
 static JAVA_VERSION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#""(?:1\.)?(\d+).*?""#).expect("valid Java version regex"));
@@ -83,15 +82,13 @@ struct Args {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskKind {
     Apk,
-    Xapk,
-    Apks,
+    AppBundle,
 }
 
 #[derive(Debug)]
 struct TaskInfo {
     kind: TaskKind,
     skip_decode: bool,
-    is_app_bundle: bool,
     output_path: PathBuf,
     output_name: String,
 }
@@ -107,7 +104,6 @@ struct Options {
     apktool: Apktool,
     signer: UberApkSigner,
     wait: bool,
-    is_app_bundle: bool,
     debuggable: bool,
     skip_decode: bool,
 }
@@ -162,7 +158,13 @@ fn run() -> Result<()> {
 
     println!("\n  ╭ apk-mitm v{VERSION}");
     println!("  ├ apktool {}", apktool.version_name());
-    println!("  ╰ uber-apk-signer {}\n", signer.version_name());
+    if info.kind == TaskKind::AppBundle {
+        println!("  ├ uber-apk-signer {}", signer.version_name());
+        println!("  ╰ apk-editor {}", ApkEditor::new().version_name());
+    } else {
+        println!("  ╰ uber-apk-signer {}", signer.version_name());
+    }
+    println!();
     if info.skip_decode {
         println!(
             "  Patching from decoded apktool directory:\n  {}\n",
@@ -182,15 +184,13 @@ fn run() -> Result<()> {
         apktool,
         signer,
         wait: args.wait,
-        is_app_bundle: info.is_app_bundle,
         debuggable: args.debuggable,
         skip_decode: info.skip_decode,
     };
 
     let uses_app_bundle = match info.kind {
         TaskKind::Apk => patch_apk(&options)?,
-        TaskKind::Xapk => patch_app_bundle(&options, true)?,
-        TaskKind::Apks => patch_app_bundle(&options, false)?,
+        TaskKind::AppBundle => patch_app_bundle(&options)?,
     };
 
     if info.kind == TaskKind::Apk && uses_app_bundle {
@@ -217,39 +217,30 @@ fn absolute_path(path: PathBuf) -> Result<PathBuf> {
 fn determine_task(input_path: &Path) -> Result<TaskInfo> {
     let metadata = fs::metadata(input_path)?;
     let mut skip_decode = false;
-    let mut is_app_bundle = false;
     let kind;
-    let output_ext;
 
     if metadata.is_dir() {
         kind = TaskKind::Apk;
         skip_decode = true;
-        output_ext = "apk";
         if !input_path.join("apktool.yml").exists() {
             bail!("No \"apktool.yml\" file found inside the input directory! Make sure to specify a directory created by \"apktool decode\".");
         }
     } else {
         let ext = input_path.extension().and_then(OsStr::to_str).unwrap_or("");
-        output_ext = ext;
-        match ext {
-            "apk" => kind = TaskKind::Apk,
-            "xapk" => {
-                kind = TaskKind::Xapk;
-                is_app_bundle = true;
-            }
-            "apks" | "zip" => {
-                kind = TaskKind::Apks;
-                is_app_bundle = true;
-            }
+        kind = match ext {
+            "apk" => TaskKind::Apk,
+            "xapk" | "apks" | "zip" => TaskKind::AppBundle,
             _ => bail!("Unsupported file type. Supported extensions: .apk, .xapk, .apks, .zip, or a decoded apktool directory."),
-        }
+        };
     }
 
     let base_name = input_path
         .file_stem()
         .and_then(OsStr::to_str)
         .ok_or_else(|| anyhow!("Could not determine input file name"))?;
-    let output_name = format!("{base_name}-patched.{output_ext}");
+    // Bundle inputs are merged into a standalone universal APK, so every
+    // input type produces a <stem>-patched.apk next to the input.
+    let output_name = format!("{base_name}-patched.apk");
     let output_path = input_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -258,7 +249,6 @@ fn determine_task(input_path: &Path) -> Result<TaskInfo> {
     Ok(TaskInfo {
         kind,
         skip_decode,
-        is_app_bundle,
         output_path,
         output_name,
     })
@@ -322,58 +312,31 @@ fn patch_apk(options: &Options) -> Result<bool> {
     Ok(uses_app_bundle)
 }
 
-fn patch_app_bundle(options: &Options, is_xapk: bool) -> Result<bool> {
+fn patch_app_bundle(options: &Options) -> Result<bool> {
     step("Checking prerequisites", || check_prerequisites(options))?;
 
-    let bundle_dir = options.tmp_dir.join("bundle");
-    step("Extracting APKs", || {
-        unzip_file(&options.input_path, &bundle_dir)
+    let merged_apk_path = options.tmp_dir.join("merged.apk");
+    step("Merging splits into universal APK", || {
+        let apk_editor = ApkEditor::new();
+        apk_editor.ensure_downloaded()?;
+        apk_editor.merge(&options.input_path, &merged_apk_path, &options.tmp_dir)
     })?;
 
-    let mut base_apk_path = bundle_dir.join("base.apk");
-    if is_xapk {
-        step("Finding base APK path", || {
-            base_apk_path = find_xapk_base_apk(&bundle_dir)?;
-            Ok(())
-        })?;
-    }
-
-    let base_options = Options {
-        input_path: base_apk_path.clone(),
-        output_path: base_apk_path.clone(),
-        tmp_dir: options.tmp_dir.join("base-apk"),
+    let merged_options = Options {
+        input_path: merged_apk_path,
+        output_path: options.output_path.clone(),
+        tmp_dir: options.tmp_dir.clone(),
         skip_patches: options.skip_patches,
         certificate_path: options.certificate_path.clone(),
         maps_api_key: options.maps_api_key.clone(),
-        apktool: Apktool::new(
-            options.tmp_dir.join("base-apk/framework"),
-            options.apktool.custom_path.clone(),
-        ),
+        apktool: options.apktool.clone(),
         signer: UberApkSigner::new(),
         wait: options.wait,
-        is_app_bundle: true,
         debuggable: options.debuggable,
         skip_decode: false,
     };
 
-    step("Patching base APK", || patch_apk(&base_options).map(|_| ()))?;
-
-    step("Signing APKs", || {
-        let apks: Vec<PathBuf> = WalkDir::new(&bundle_dir)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry.file_type().is_file() && entry.path().extension() == Some(OsStr::new("apk"))
-            })
-            .map(|entry| entry.path().to_path_buf())
-            .collect();
-        options.signer.sign(&apks, false, &options.tmp_dir)
-    })?;
-
-    step("Compressing APKs", || {
-        zip_dir(&bundle_dir, &options.output_path)
-    })?;
-    Ok(false)
+    patch_apk(&merged_options)
 }
 
 fn step<T>(name: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -396,25 +359,9 @@ fn check_prerequisites(options: &Options) -> Result<()> {
     if java_major < 8 {
         bail!("apk-mitm requires at least Java 8; found Java {java_major}.");
     }
-    if options.is_app_bundle && !cfg!(windows) {
-        ensure_command("zip")?;
-        ensure_command("unzip")?;
-    }
     options.apktool.ensure_downloaded()?;
     options.signer.ensure_downloaded()?;
     Ok(())
-}
-
-fn ensure_command(name: &str) -> Result<()> {
-    let status = Command::new(name)
-        .arg("-v")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match status {
-        Ok(status) if status.success() => Ok(()),
-        _ => bail!("apk-mitm requires the command \"{name}\" when patching App Bundles."),
-    }
 }
 
 fn get_java_major_version() -> Result<u32> {
@@ -547,6 +494,45 @@ impl UberApkSigner {
             args.push(path.display().to_string());
         }
         run_jar(&self.jar_path(), &args, "signing", tmp_dir)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ApkEditor;
+
+impl ApkEditor {
+    fn new() -> Self {
+        Self
+    }
+
+    fn version_name(&self) -> String {
+        format!("v{APKEDITOR_VERSION}")
+    }
+
+    fn jar_path(&self) -> PathBuf {
+        cache_path(&format!("APKEditor-{APKEDITOR_VERSION}.jar"))
+    }
+
+    fn ensure_downloaded(&self) -> Result<()> {
+        download_cached(
+            &self.jar_path(),
+            &format!("https://github.com/REAndroid/APKEditor/releases/download/V{APKEDITOR_VERSION}/APKEditor-{APKEDITOR_VERSION}.jar"),
+        )
+    }
+
+    fn merge(&self, input: &Path, output: &Path, tmp_dir: &Path) -> Result<()> {
+        run_jar(
+            &self.jar_path(),
+            &[
+                "m".into(),
+                "-i".into(),
+                input.display().to_string(),
+                "-o".into(),
+                output.display().to_string(),
+            ],
+            "merging",
+            tmp_dir,
+        )
     }
 }
 
@@ -961,77 +947,6 @@ fn patch_smali_method(content: &str, method: &SmaliMethodPatch) -> Result<(Strin
     Ok((result.into_owned(), changed))
 }
 
-fn unzip_file(input: &Path, output_dir: &Path) -> Result<()> {
-    fs::create_dir_all(output_dir)?;
-    let file = File::open(input)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let outpath = match file.enclosed_name() {
-            Some(path) => output_dir.join(path),
-            None => continue,
-        };
-        if file.is_dir() {
-            fs::create_dir_all(&outpath)?;
-        } else {
-            if let Some(parent) = outpath.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut outfile = File::create(&outpath)?;
-            io::copy(&mut file, &mut outfile)?;
-        }
-    }
-    Ok(())
-}
-
-fn zip_dir(input_dir: &Path, output: &Path) -> Result<()> {
-    let file = File::create(output)?;
-    let mut zip = zip::ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    let mut buffer = Vec::new();
-    for entry in WalkDir::new(input_dir).into_iter().filter_map(Result::ok) {
-        let path = entry.path();
-        let name = path
-            .strip_prefix(input_dir)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        if name.is_empty() {
-            continue;
-        }
-        if entry.file_type().is_dir() {
-            zip.add_directory(format!("{name}/"), options)?;
-        } else {
-            zip.start_file(name, options)?;
-            let mut f = File::open(path)?;
-            f.read_to_end(&mut buffer)?;
-            zip.write_all(&buffer)?;
-            buffer.clear();
-        }
-    }
-    zip.finish()?;
-    Ok(())
-}
-
-fn find_xapk_base_apk(bundle_dir: &Path) -> Result<PathBuf> {
-    let manifest = fs::read_to_string(bundle_dir.join("manifest.json"))?;
-    let json: Value = serde_json::from_str(&manifest)?;
-    if let Some(split_apks) = json.get("split_apks").and_then(Value::as_array) {
-        if let Some(file) = split_apks
-            .iter()
-            .find(|apk| apk.get("id") == Some(&Value::String("base".into())))
-            .and_then(|apk| apk.get("file"))
-            .and_then(Value::as_str)
-        {
-            return Ok(bundle_dir.join(file));
-        }
-    }
-    let package = json
-        .get("package_name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("XAPK manifest has no package_name"))?;
-    Ok(bundle_dir.join(format!("{package}.apk")))
-}
-
 fn show_app_bundle_warning() {
     println!(
         "\n  WARNING\n\n  This app seems to use Android App Bundle split APKs. You may run into\n  installation problems because only one APK was patched. Supply a .xapk or\n  .apks file containing all APKs to patch the bundle.\n"
@@ -1079,5 +994,43 @@ mod tests {
         assert!(output.contains("android:networkSecurityConfig=\"@xml/nsc_mitm\""));
         assert!(output.contains("android:debuggable=\"true\""));
         assert!(output.contains("android:value=\"new-key\""));
+    }
+
+    #[test]
+    fn bundle_inputs_produce_standalone_patched_apk_output() {
+        let temp = tempfile::tempdir().unwrap();
+        for ext in ["xapk", "apks", "zip"] {
+            let input = temp.path().join(format!("com.example.app.{ext}"));
+            fs::write(&input, b"dummy").unwrap();
+            let info = determine_task(&input).unwrap();
+            assert_eq!(info.kind, TaskKind::AppBundle);
+            assert_eq!(info.output_name, "com.example.app-patched.apk");
+            assert_eq!(
+                info.output_path,
+                temp.path().join("com.example.app-patched.apk")
+            );
+        }
+    }
+
+    #[test]
+    fn apk_input_produces_patched_apk_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("app.apk");
+        fs::write(&input, b"dummy").unwrap();
+        let info = determine_task(&input).unwrap();
+        assert_eq!(info.kind, TaskKind::Apk);
+        assert!(!info.skip_decode);
+        assert_eq!(info.output_name, "app-patched.apk");
+        assert_eq!(info.output_path, temp.path().join("app-patched.apk"));
+    }
+
+    #[test]
+    fn decoded_directory_produces_patched_apk_output() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("apktool.yml"), b"version: 2.9.3").unwrap();
+        let info = determine_task(temp.path()).unwrap();
+        assert_eq!(info.kind, TaskKind::Apk);
+        assert!(info.skip_decode);
+        assert!(info.output_name.ends_with("-patched.apk"));
     }
 }
