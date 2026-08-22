@@ -1,49 +1,93 @@
-# apk-mitm (Rust rewrite)
+<div align="center">
 
-A Rust CLI that prepares Android APK/XAPK/APKS/ZIP files for HTTPS inspection.
+# apk-mitm
 
-It mirrors the original `apk-mitm` flow:
+**Patch Android apps for HTTPS inspection — fast, repeatable, and split-aware.**
 
-- merge XAPK/APKS/ZIP split bundles into one universal APK with APKEditor
-- decode APKs with Apktool
-- replace the app Network Security Configuration
-- patch common Smali certificate pinning implementations
-- rebuild with Apktool (AAPT2, then AAPT fallback)
-- sign with uber-apk-signer
+[![Rust](https://img.shields.io/badge/Rust-2021-000000?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![Android](https://img.shields.io/badge/Android-APK-3DDC84?style=flat-square&logo=android&logoColor=white)](https://developer.android.com/)
+[![Java](https://img.shields.io/badge/Java-8%2B-ED8B00?style=flat-square&logo=openjdk&logoColor=white)](https://openjdk.org/)
+[![License](https://img.shields.io/github/license/goodza/apk-mitm-rs?style=flat-square)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/goodza/apk-mitm-rs?style=flat-square)](https://github.com/goodza/apk-mitm-rs/stargazers)
+[![Issues](https://img.shields.io/github/issues/goodza/apk-mitm-rs?style=flat-square)](https://github.com/goodza/apk-mitm-rs/issues)
 
-## Build
+<pre align="center">
+\               /
+\             /
+.-#######################-.
+/#####  ###     ###  #####\
+|#####  ###     ###  #####|
+|#########################|
+.---+#########################+---.
+|###|###### APK >> MITM ######|###|
+'---+#########################+---'
+|#########################|
+|########|       |########|
+|########|       |########|
+'--------'       '--------'
+</pre>
+
+</div>
+
+---
+
+## ✨ Highlights
+
+- Accepts `.apk`, `.xapk`, `.apks`, `.zip`, and decoded Apktool directories.
+- Merges split bundles into a standalone universal APK.
+- Replaces the Network Security Configuration for HTTPS inspection.
+- Patches common Smali certificate-pinning implementations.
+- Rebuilds, zip-aligns, and signs the final APK automatically.
+
+> **APK / XAPK / APKS / ZIP → Merge → Decode → Patch → Rebuild → Sign**
+
+## 🚀 Quick start
+
+**Requirements:** Java 8+ and a Rust toolchain.
 
 ```sh
+git clone https://github.com/goodza/apk-mitm-rs.git
+cd apk-mitm-rs
 cargo build --release
 ```
 
-## Usage
+Patch an app:
 
 ```sh
-apk-mitm <path-to-apk/xapk/apks/zip/decoded-directory>
+target/release/apk-mitm path/to/app.apk
 ```
 
-The patched output is always a standalone APK named `<input-name>-patched.apk`,
-written next to the input. Bundle inputs (`.xapk`, `.apks`, `.zip`) are first
-merged with APKEditor into one universal APK that contains the base APK plus
-all density/configuration splits, so split resources resolve correctly when
-Apktool decodes and rebuilds the app.
-
-Required tools are downloaded into the OS cache directory on first use:
-
-- apktool v2.9.3
-- uber-apk-signer v1.3.0
-- APKEditor v1.4.3 (bundle inputs only)
-
-Flags:
+The result is written beside the input:
 
 ```text
---wait                         Wait for manual changes before re-encoding
---tmp-dir <path>                Where temporary files will be stored
---keep-tmp-dir                  Don't delete the temporary directory after patching
---debuggable                    Make the patched app debuggable
---skip-patches                  Don't apply any patches
---apktool <path-to-jar>         Use a custom Apktool JAR
---certificate <path-to-pem/der> Add a specific certificate to network security config
---maps-api-key <api-key>        Replace Google Maps API key meta-data values
+app-patched.apk
 ```
+
+## ⚙️ Options
+
+| Option | Description |
+|---|---|
+| `--skip-patches` | Decode and rebuild without applying patches |
+| `--debuggable` | Mark the app as debuggable |
+| `--certificate <file>` | Add a PEM or DER certificate |
+| `--maps-api-key <key>` | Replace Google Maps API keys |
+| `--apktool <jar>` | Use a custom Apktool JAR |
+| `--tmp-dir <path>` | Choose the temporary directory |
+| `--keep-tmp-dir` | Preserve temporary files for inspection |
+| `--wait` | Pause before rebuilding |
+
+Run `apk-mitm --help` for complete usage details.
+
+## 🧰 Toolchain
+
+Dependencies are downloaded to the OS cache on first use.
+
+| Tool | Purpose |
+|---|---|
+| [APKEditor](https://github.com/REAndroid/APKEditor) | Merge split APK bundles |
+| [Apktool](https://apktool.org/) | Decode and rebuild APKs |
+| [uber-apk-signer](https://github.com/patrickfav/uber-apk-signer) | Zip-align and sign output APKs |
+
+## 📄 License
+
+Released under the [MIT License](LICENSE).
