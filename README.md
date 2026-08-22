@@ -7,6 +7,8 @@
 [![Rust](https://img.shields.io/badge/Rust-2021-000000?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Android](https://img.shields.io/badge/Android-APK-3DDC84?style=flat-square&logo=android&logoColor=white)](https://developer.android.com/)
 [![Java](https://img.shields.io/badge/Java-8%2B-ED8B00?style=flat-square&logo=openjdk&logoColor=white)](https://openjdk.org/)
+[![Release](https://img.shields.io/github/v/release/goodza/apk-mitm-rs?style=flat-square)](https://github.com/goodza/apk-mitm-rs/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/goodza/apk-mitm-rs/total?style=flat-square)](https://github.com/goodza/apk-mitm-rs/releases)
 [![License](https://img.shields.io/github/license/goodza/apk-mitm-rs?style=flat-square)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/goodza/apk-mitm-rs?style=flat-square)](https://github.com/goodza/apk-mitm-rs/stargazers)
 [![Issues](https://img.shields.io/github/issues/goodza/apk-mitm-rs?style=flat-square)](https://github.com/goodza/apk-mitm-rs/issues)
@@ -43,7 +45,10 @@
 
 ## 🚀 Quick start
 
-**Requirements:** Java 8+ and a Rust toolchain.
+Download a ready-to-run archive for Linux, Windows, or macOS from the
+[latest release](https://github.com/goodza/apk-mitm-rs/releases/latest).
+
+To build from source, install Java 8+ and a Rust toolchain:
 
 ```sh
 git clone https://github.com/goodza/apk-mitm-rs.git
