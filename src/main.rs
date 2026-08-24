@@ -4,7 +4,7 @@ use regex::Regex;
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -28,12 +28,6 @@ static META_DATA_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
 static META_DATA_VALUE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\sandroid:value\s*=\s*(?:\"[^\"]*\"|'[^']*')"#)
         .expect("valid meta-data value regex")
-});
-static SMALI_CLASS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\.class(?P<keywords>.+)? L(?P<name>[^\s]+);").expect("valid smali class regex")
-});
-static SMALI_IMPLEMENTS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\.implements L(?P<name>[^\s]+);").expect("valid smali implements regex")
 });
 
 #[derive(Parser, Debug)]
@@ -65,6 +59,10 @@ struct Args {
     /// Don't apply any patches (for troubleshooting)
     #[arg(long = "skip-patches")]
     skip_patches: bool,
+
+    /// Decode Smali and apply pinning patches (slower, broader coverage)
+    #[arg(long = "full-smali")]
+    full_smali: bool,
 
     /// Use custom version of Apktool
     #[arg(long)]
@@ -99,6 +97,7 @@ struct Options {
     output_path: PathBuf,
     tmp_dir: PathBuf,
     skip_patches: bool,
+    full_smali: bool,
     certificate_path: Option<PathBuf>,
     maps_api_key: Option<String>,
     apktool: Apktool,
@@ -179,6 +178,7 @@ fn run() -> Result<()> {
         output_path: info.output_path.clone(),
         tmp_dir: tmp_dir.clone(),
         skip_patches: args.skip_patches,
+        full_smali: args.full_smali,
         certificate_path,
         maps_api_key: args.maps_api_key,
         apktool,
@@ -266,9 +266,12 @@ fn patch_apk(options: &Options) -> Result<bool> {
 
     if !options.skip_decode {
         step("Decoding APK file", || {
-            options
-                .apktool
-                .decode(&options.input_path, &decode_dir, &options.tmp_dir)
+            options.apktool.decode(
+                &options.input_path,
+                &decode_dir,
+                options.full_smali,
+                &options.tmp_dir,
+            )
         })?;
     }
 
@@ -327,6 +330,7 @@ fn patch_app_bundle(options: &Options) -> Result<bool> {
         output_path: options.output_path.clone(),
         tmp_dir: options.tmp_dir.clone(),
         skip_patches: options.skip_patches,
+        full_smali: options.full_smali,
         certificate_path: options.certificate_path.clone(),
         maps_api_key: options.maps_api_key.clone(),
         apktool: options.apktool.clone(),
@@ -418,19 +422,30 @@ impl Apktool {
         )
     }
 
-    fn decode(&self, input: &Path, output: &Path, tmp_dir: &Path) -> Result<()> {
-        self.run(
-            &[
-                "decode".into(),
-                input.display().to_string(),
-                "--output".into(),
-                output.display().to_string(),
-                "--frame-path".into(),
-                self.framework_path.display().to_string(),
-            ],
-            "decoding",
-            tmp_dir,
-        )
+    fn decode(
+        &self,
+        input: &Path,
+        output: &Path,
+        decode_sources: bool,
+        tmp_dir: &Path,
+    ) -> Result<()> {
+        let args = self.decode_args(input, output, decode_sources);
+        self.run(&args, "decoding", tmp_dir)
+    }
+
+    fn decode_args(&self, input: &Path, output: &Path, decode_sources: bool) -> Vec<String> {
+        let mut args = vec![
+            "decode".into(),
+            input.display().to_string(),
+            "--output".into(),
+            output.display().to_string(),
+            "--frame-path".into(),
+            self.framework_path.display().to_string(),
+        ];
+        if !decode_sources {
+            args.push("--no-src".into());
+        }
+        args
     }
 
     fn encode(&self, input: &Path, output: &Path, use_aapt2: bool, tmp_dir: &Path) -> Result<()> {
@@ -597,7 +612,9 @@ fn apply_patches(decode_dir: &Path, options: &Options) -> Result<bool> {
         &decode_dir.join("res/xml/nsc_mitm.xml"),
         options.certificate_path.as_deref(),
     )?;
-    disable_certificate_pinning(decode_dir)?;
+    if options.full_smali {
+        disable_certificate_pinning(decode_dir)?;
+    }
     Ok(uses_app_bundle)
 }
 
@@ -826,24 +843,15 @@ struct SmaliHead {
 fn disable_certificate_pinning(decode_dir: &Path) -> Result<bool> {
     println!("\n    Scanning Smali files...");
     let mut found = false;
-    for entry in WalkDir::new(decode_dir).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() || entry.path().extension() != Some(OsStr::new("smali")) {
-            continue;
-        }
-        let rel = entry
-            .path()
-            .strip_prefix(decode_dir)
-            .unwrap_or(entry.path());
-        if !rel
-            .components()
-            .next()
-            .and_then(|c| c.as_os_str().to_str())
-            .is_some_and(|s| s.starts_with("smali"))
-        {
-            continue;
-        }
-        if process_smali_file(entry.path())? {
-            found = true;
+    for root in smali_roots(decode_dir)? {
+        for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() || entry.path().extension() != Some(OsStr::new("smali"))
+            {
+                continue;
+            }
+            if process_smali_file(entry.path())? {
+                found = true;
+            }
         }
     }
     if !found {
@@ -852,14 +860,25 @@ fn disable_certificate_pinning(decode_dir: &Path) -> Result<bool> {
     Ok(found)
 }
 
+fn smali_roots(decode_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for entry in fs::read_dir(decode_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("smali"))
+        {
+            roots.push(entry.path());
+        }
+    }
+    roots.sort_unstable();
+    Ok(roots)
+}
+
 fn process_smali_file(path: &Path) -> Result<bool> {
-    let original = fs::read_to_string(path)?;
-    let normalized = if cfg!(windows) {
-        Cow::Owned(original.replace("\r\n", "\n"))
-    } else {
-        Cow::Borrowed(original.as_str())
-    };
-    let head = parse_smali_head(&normalized)?;
+    let head = parse_smali_head_reader(BufReader::new(File::open(path)?))?;
     if head.is_interface {
         return Ok(false);
     }
@@ -871,6 +890,12 @@ fn process_smali_file(path: &Path) -> Result<bool> {
         return Ok(false);
     }
 
+    let original = fs::read_to_string(path)?;
+    let normalized = if cfg!(windows) {
+        Cow::Owned(original.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(original.as_str())
+    };
     let mut patched = normalized.into_owned();
     let mut changed = false;
     for patch in applicable_patches {
@@ -892,22 +917,51 @@ fn process_smali_file(path: &Path) -> Result<bool> {
     Ok(changed)
 }
 
+#[cfg(test)]
 fn parse_smali_head(content: &str) -> Result<SmaliHead> {
-    let caps = SMALI_CLASS_RE
-        .captures(content)
-        .ok_or_else(|| anyhow!("Smali file has no .class line"))?;
-    let keywords = caps.name("keywords").map(|m| m.as_str()).unwrap_or("");
-    let name = caps.name("name").unwrap().as_str().to_string();
-    let implements = SMALI_IMPLEMENTS_RE
-        .captures_iter(content)
-        .map(|caps| caps.name("name").unwrap().as_str().to_string())
-        .collect();
-    let is_interface = keywords.split_whitespace().any(|part| part == "interface");
+    parse_smali_head_reader(BufReader::new(content.as_bytes()))
+}
+
+fn parse_smali_head_reader(reader: impl BufRead) -> Result<SmaliHead> {
+    let mut name = None;
+    let mut implements = Vec::new();
+    let mut is_interface = false;
+
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.starts_with(".method") {
+            break;
+        }
+        if let Some(declaration) = line.strip_prefix(".class") {
+            let mut parts = declaration.split_whitespace();
+            let mut class_name = None;
+            for part in parts.by_ref() {
+                if let Some(value) = smali_type_name(part) {
+                    class_name = Some(value.to_string());
+                    break;
+                }
+                if part == "interface" {
+                    is_interface = true;
+                }
+            }
+            name = class_name;
+        } else if let Some(declaration) = line.strip_prefix(".implements") {
+            if let Some(interface_name) = declaration.split_whitespace().find_map(smali_type_name) {
+                implements.push(interface_name.to_string());
+            }
+        }
+    }
+
     Ok(SmaliHead {
-        name,
+        name: name.ok_or_else(|| anyhow!("Smali file has no .class line"))?,
         implements,
         is_interface,
     })
+}
+
+fn smali_type_name(value: &str) -> Option<&str> {
+    value.strip_prefix('L')?.strip_suffix(';')
 }
 
 fn selector_matches(patch: &SmaliPatch, head: &SmaliHead) -> bool {
@@ -982,6 +1036,83 @@ mod tests {
         assert_eq!(head.name, "x/Y");
         assert_eq!(head.implements, vec!["javax/net/ssl/HostnameVerifier"]);
         assert!(!head.is_interface);
+    }
+
+    #[test]
+    fn parses_interface_head_with_crlf_and_stops_at_first_method() {
+        let content = concat!(
+            ".class public abstract interface Lx/Y;\r\n",
+            ".implements Lfoo/First;\r\n",
+            ".implements Lfoo/Second;\r\n",
+            ".method public test()V\r\n",
+            ".implements Lfoo/NotAHeaderDirective;\r\n",
+        );
+        let head = parse_smali_head(content).unwrap();
+        assert_eq!(head.name, "x/Y");
+        assert_eq!(head.implements, vec!["foo/First", "foo/Second"]);
+        assert!(head.is_interface);
+    }
+
+    #[test]
+    fn discovers_only_top_level_smali_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let smali = temp.path().join("smali");
+        let multidex = temp.path().join("smali_classes2");
+        fs::create_dir_all(&smali).unwrap();
+        fs::create_dir_all(&multidex).unwrap();
+        fs::create_dir_all(temp.path().join("res/smali_decoy")).unwrap();
+        fs::create_dir_all(temp.path().join("assets")).unwrap();
+        fs::write(temp.path().join("smali_file"), b"not a directory").unwrap();
+
+        assert_eq!(smali_roots(temp.path()).unwrap(), vec![smali, multidex]);
+    }
+
+    #[test]
+    fn non_candidate_smali_does_not_require_valid_method_body_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Unrelated.smali");
+        let mut content = b".class public Lx/Unrelated;\n.method public test()V\n".to_vec();
+        content.push(0xff);
+        fs::write(&path, content).unwrap();
+
+        assert!(!process_smali_file(&path).unwrap());
+    }
+
+    #[test]
+    fn candidate_smali_file_is_fully_patched() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("CertificatePinner.smali");
+        fs::write(
+            &path,
+            ".class public final Lokhttp3/CertificatePinner;\n.method public check(Ljava/lang/String;Ljava/util/List;)V\n    .locals 0\n    return-void\n.end method\n",
+        )
+        .unwrap();
+
+        assert!(process_smali_file(&path).unwrap());
+        let patched = fs::read_to_string(path).unwrap();
+        assert!(patched.contains("# inserted by apk-mitm"));
+    }
+
+    #[test]
+    fn apktool_decode_sources_are_opt_in() {
+        let apktool = Apktool::new(
+            PathBuf::from("framework"),
+            Some(PathBuf::from("apktool.jar")),
+        );
+        let full_args = apktool.decode_args(Path::new("in.apk"), Path::new("out"), true);
+        let default_args = apktool.decode_args(Path::new("in.apk"), Path::new("out"), false);
+
+        assert!(!full_args.iter().any(|arg| arg == "--no-src"));
+        assert!(default_args.iter().any(|arg| arg == "--no-src"));
+    }
+
+    #[test]
+    fn full_smali_is_disabled_by_default_and_can_be_enabled() {
+        let default_args = Args::try_parse_from(["apk-mitm", "app.apk"]).unwrap();
+        let full_args = Args::try_parse_from(["apk-mitm", "--full-smali", "app.apk"]).unwrap();
+
+        assert!(!default_args.full_smali);
+        assert!(full_args.full_smali);
     }
 
     #[test]
