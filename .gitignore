@@ -1,7 +1,14 @@
-/target
-*.apk
-*.apks
-*.xapk
-dl/
-.itest/
-*.txt
+# Ignore every file by default.
+*
+
+# Keep directories traversable so individual files can be included below.
+!*/
+
+# Repository files.
+!/.gitignore
+!/Cargo.lock
+!/Cargo.toml
+!/LICENSE
+!/README.md
+!/.github/workflows/release.yml
+!/src/main.rs
