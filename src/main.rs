@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use walkdir::WalkDir;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const APKTOOL_VERSION: &str = "2.9.3";
+const APKTOOL_VERSION: &str = "3.0.3";
 const UBER_APK_SIGNER_VERSION: &str = "1.3.0";
 const APKEDITOR_VERSION: &str = "1.4.3";
 
@@ -289,20 +289,11 @@ fn patch_apk(options: &Options) -> Result<bool> {
         })?;
     }
 
-    println!("  Encoding patched APK file");
-    match options
-        .apktool
-        .encode(&decode_dir, &tmp_apk_path, true, &options.tmp_dir)
-    {
-        Ok(_) => println!("    ✓ Encoding using AAPT2"),
-        Err(error) => {
-            println!("    ! AAPT2 failed, falling back to AAPT: {error}");
-            options
-                .apktool
-                .encode(&decode_dir, &tmp_apk_path, false, &options.tmp_dir)?;
-            println!("    ✓ Encoding using AAPT fallback");
-        }
-    }
+    step("Encoding patched APK file", || {
+        options
+            .apktool
+            .encode(&decode_dir, &tmp_apk_path, &options.tmp_dir)
+    })?;
 
     step("Signing patched APK file", || {
         options
@@ -448,8 +439,10 @@ impl Apktool {
         args
     }
 
-    fn encode(&self, input: &Path, output: &Path, use_aapt2: bool, tmp_dir: &Path) -> Result<()> {
-        let mut args = vec![
+    fn encode(&self, input: &Path, output: &Path, tmp_dir: &Path) -> Result<()> {
+        // Let the selected Apktool choose its compiler. Apktool 3.x only
+        // supports AAPT2 and no longer accepts --use-aapt2/--use-aapt1.
+        let args = vec![
             "build".into(),
             input.display().to_string(),
             "--output".into(),
@@ -457,18 +450,7 @@ impl Apktool {
             "--frame-path".into(),
             self.framework_path.display().to_string(),
         ];
-        if use_aapt2 {
-            args.push("--use-aapt2".into());
-        }
-        self.run(
-            &args,
-            if use_aapt2 {
-                "encoding-aapt2"
-            } else {
-                "encoding-aapt"
-            },
-            tmp_dir,
-        )
+        self.run(&args, "encoding", tmp_dir)
     }
 
     fn run(&self, args: &[String], log_name: &str, tmp_dir: &Path) -> Result<()> {

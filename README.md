@@ -114,7 +114,7 @@ Dependencies are downloaded to the OS cache on first use.
 | Tool | Purpose |
 |---|---|
 | [APKEditor](https://github.com/REAndroid/APKEditor) | Merge split APK bundles |
-| [Apktool](https://apktool.org/) | Decode and rebuild APKs |
+| [Apktool 3.0.3](https://apktool.org/) | Decode and rebuild APKs, preserving references to stripped resources |
 | [uber-apk-signer](https://github.com/patrickfav/uber-apk-signer) | Zip-align and sign output APKs |
 
 ## 📄 License
